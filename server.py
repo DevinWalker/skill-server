@@ -1,16 +1,18 @@
-"""Skill Server — serves SKILL.md files with a dashboard UI."""
+"""Skill Server — serves SKILL.md files with a dashboard UI and token auth."""
 import hashlib
 import hmac
 import json
 import os
+import secrets
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, Cookie
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
 import yaml
 import markdown
@@ -21,10 +23,46 @@ REPO_URL = os.environ.get("REPO_URL", "https://github.com/DevinWalker/agent-skil
 REPO_DIR = Path("/data/skills")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
+API_TOKEN = os.environ.get("API_TOKEN", "")  # Required for all access
+
+# Session tokens for browser auth (login form sets a cookie)
+active_sessions: set[str] = set()
 
 # Track sync events
 sync_log: list[dict] = []
 last_sync: dict = {"time": None, "status": None, "commit": None}
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def verify_token(token: str) -> bool:
+    """Constant-time comparison of a token against API_TOKEN."""
+    if not API_TOKEN:
+        return True  # No token configured = open (dev mode)
+    return secrets.compare_digest(token, API_TOKEN)
+
+
+def require_auth(request: Request):
+    """Check auth via Bearer token OR session cookie. Raise 401/403 on failure."""
+    # 1. Bearer token (for agents / API clients)
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if verify_token(token):
+            return True
+        raise HTTPException(403, "Invalid token")
+
+    # 2. Session cookie (for browser dashboard)
+    session = request.cookies.get("skill_session")
+    if session and session in active_sessions:
+        return True
+
+    # 3. Query param (for simple curl usage)
+    token = request.query_params.get("token", "")
+    if token and verify_token(token):
+        return True
+
+    raise HTTPException(401, "Authentication required")
 
 
 def clone_or_pull():
@@ -41,7 +79,6 @@ def clone_or_pull():
             subprocess.run(["git", "-C", str(REPO_DIR), "pull", "--ff-only"],
                            check=True, capture_output=True)
 
-        # Get current commit info
         result = subprocess.run(
             ["git", "-C", str(REPO_DIR), "log", "-1", "--format=%H|%s|%ai"],
             capture_output=True, text=True
@@ -84,21 +121,17 @@ def find_skills():
                 except Exception:
                     pass
 
-        # Category from path
         category = str(skill_dir).split("/")[0] if "/" in str(skill_dir) else "uncategorized"
 
-        # Reference files
         refs_dir = skill_md.parent / "references"
         refs = []
         if refs_dir.is_dir():
             refs = [str(f.relative_to(skill_md.parent)) for f in sorted(refs_dir.rglob("*")) if f.is_file()]
 
-        # All non-.git files
         all_files = [str(f.relative_to(skill_md.parent))
                      for f in sorted(skill_md.parent.rglob("*"))
                      if f.is_file() and ".git" not in str(f)]
 
-        # Word count of SKILL.md
         body = content.split("---", 2)[2] if content.startswith("---") and content.count("---") >= 2 else content
         word_count = len(body.split())
 
@@ -127,6 +160,54 @@ def render_markdown(text: str) -> str:
     return markdown.markdown(text, extensions=["tables", "fenced_code", "codehilite"])
 
 
+# --- Login page (no auth required) ---
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login — Skill Server</title>
+<style>
+  :root { --bg: #0d1117; --surface: #161b22; --border: #30363d;
+          --text: #e6edf3; --accent: #58a6ff; --red: #f85149; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: var(--bg); color: var(--text); display: flex;
+         align-items: center; justify-content: center; min-height: 100vh; }
+  .card { background: var(--surface); border: 1px solid var(--border);
+          border-radius: 12px; padding: 32px; width: 100%; max-width: 380px; }
+  h1 { font-size: 20px; margin-bottom: 8px; }
+  p { font-size: 13px; color: #8b949e; margin-bottom: 20px; }
+  input { width: 100%; padding: 10px 14px; border: 1px solid var(--border);
+          border-radius: 6px; background: var(--bg); color: var(--text);
+          font-size: 14px; margin-bottom: 12px; outline: none; }
+  input:focus { border-color: var(--accent); }
+  button { width: 100%; padding: 10px; background: var(--accent); border: none;
+           border-radius: 6px; color: #fff; font-size: 14px; font-weight: 600;
+           cursor: pointer; }
+  button:hover { opacity: 0.9; }
+  .err { color: var(--red); font-size: 13px; margin-bottom: 12px; display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>⚡ Skill Server</h1>
+  <p>Enter your API token to access the dashboard.</p>
+  <div class="err" id="err">Invalid token. Try again.</div>
+  <form method="POST" action="/login">
+    <input type="password" name="token" placeholder="API token" autofocus required>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+<script>
+  if (location.search.includes('error=1'))
+    document.getElementById('err').style.display = 'block';
+</script>
+</body>
+</html>"""
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -150,6 +231,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
            padding: 20px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
   header h1 { font-size: 22px; font-weight: 600; }
   header h1 span { color: var(--accent); }
+  .logout { font-size: 13px; color: var(--text-muted); text-decoration: none;
+            border: 1px solid var(--border); padding: 4px 12px; border-radius: 6px; }
+  .logout:hover { color: var(--text); border-color: var(--text-muted); }
 
   .sync-bar { display: flex; align-items: center; gap: 12px;
               background: var(--surface); border: 1px solid var(--border);
@@ -252,7 +336,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="container">
   <header>
     <h1><span>⚡</span> Skill Server</h1>
-    <div style="font-size:13px; color:var(--text-muted)">Devin Walker</div>
+    <a href="/logout" class="logout">Sign out</a>
   </header>
 
   <div class="sync-bar" id="syncBar">
@@ -283,6 +367,7 @@ let skillData = [];
 
 async function load() {
   const r = await fetch('/api/dashboard');
+  if (r.status === 401) { location.href = '/login'; return; }
   const d = await r.json();
   skillData = d.skills;
   renderStats(d);
@@ -341,7 +426,6 @@ async function openSkill(path) {
 
   document.getElementById('modalTitle').textContent = skill.name;
 
-  // Build tabs
   const tabs = [{id: 'rendered', label: 'Rendered'}, {id: 'raw', label: 'Raw'}];
   skill.files.references.forEach(r => {
     const name = r.split('/').pop().replace('.md','');
@@ -435,32 +519,95 @@ load();
 </html>"""
 
 
-# --- API Routes ---
+# --- Public routes (no auth) ---
 
 @app.on_event("startup")
 def startup():
     clone_or_pull()
 
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return LOGIN_HTML
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    token = form.get("token", "")
+    if not verify_token(token):
+        return RedirectResponse("/login?error=1", status_code=303)
+
+    session_id = secrets.token_urlsafe(32)
+    active_sessions.add(session_id)
+    # Cap sessions to prevent memory leak
+    if len(active_sessions) > 100:
+        active_sessions.pop()
+
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("skill_session", session_id, httponly=True, secure=True,
+                        samesite="lax", max_age=86400 * 7)
+    return response
+
+
+@app.get("/logout")
+def logout(request: Request):
+    session = request.cookies.get("skill_session")
+    if session:
+        active_sessions.discard(session)
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie("skill_session")
+    return response
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    """GitHub push webhook — authenticated by HMAC, not bearer token."""
+    body = await request.body()
+
+    if WEBHOOK_SECRET:
+        sig = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(
+            WEBHOOK_SECRET.encode(), body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(403, "Invalid signature")
+
+    def do_pull():
+        try:
+            clone_or_pull()
+        except Exception as e:
+            print(f"Pull failed: {e}")
+
+    threading.Thread(target=do_pull, daemon=True).start()
+    return {"status": "pulling"}
+
+
+# --- Protected routes (require auth) ---
+
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
-    """Serve the dashboard UI."""
+def dashboard(request: Request):
+    try:
+        require_auth(request)
+    except HTTPException:
+        return RedirectResponse("/login", status_code=303)
     return DASHBOARD_HTML
 
 
 @app.get("/api/dashboard", response_class=JSONResponse)
-def api_dashboard():
-    """Full dashboard data."""
-    return {
-        "skills": find_skills(),
-        "sync": last_sync,
-        "repo": REPO_URL,
-    }
+def api_dashboard(request: Request):
+    require_auth(request)
+    return {"skills": find_skills(), "sync": last_sync, "repo": REPO_URL}
 
 
 @app.get("/api/skill/{path:path}/rendered", response_class=JSONResponse)
-def api_skill_rendered(path: str):
-    """Render a skill's SKILL.md to HTML."""
+def api_skill_rendered(path: str, request: Request):
+    require_auth(request)
     file_path = REPO_DIR / path / "SKILL.md"
     if not file_path.is_file():
         raise HTTPException(404)
@@ -470,38 +617,33 @@ def api_skill_rendered(path: str):
 
 @app.post("/api/render", response_class=JSONResponse)
 async def api_render(request: Request):
-    """Render arbitrary markdown."""
+    require_auth(request)
     data = await request.json()
     return {"html": render_markdown(data.get("text", ""))}
 
 
 @app.post("/api/sync")
-def api_sync():
-    """Trigger a manual sync."""
+def api_sync(request: Request):
+    require_auth(request)
     clone_or_pull()
     return {"status": "synced", "sync": last_sync}
 
 
 @app.get("/api/sync-log", response_class=JSONResponse)
-def api_sync_log():
-    """Return recent sync events."""
+def api_sync_log(request: Request):
+    require_auth(request)
     return {"log": list(sync_log)}
 
 
 @app.get("/catalog", response_class=JSONResponse)
-def catalog():
-    """Machine-readable catalog."""
+def catalog(request: Request):
+    require_auth(request)
     return {"skills": find_skills()}
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
 @app.get("/{path:path}")
-def serve_file(path: str):
-    """Serve any file from the repo."""
+def serve_file(path: str, request: Request):
+    require_auth(request)
     file_path = REPO_DIR / path
 
     if file_path.is_dir():
@@ -526,29 +668,6 @@ def serve_file(path: str):
     }.get(suffix, "text/plain; charset=utf-8")
 
     return Response(content=content, media_type=ct)
-
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    """GitHub push webhook."""
-    body = await request.body()
-
-    if WEBHOOK_SECRET:
-        sig = request.headers.get("X-Hub-Signature-256", "")
-        expected = "sha256=" + hmac.new(
-            WEBHOOK_SECRET.encode(), body, hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            raise HTTPException(403, "Invalid signature")
-
-    def do_pull():
-        try:
-            clone_or_pull()
-        except Exception as e:
-            print(f"Pull failed: {e}")
-
-    threading.Thread(target=do_pull, daemon=True).start()
-    return {"status": "pulling"}
 
 
 if __name__ == "__main__":
